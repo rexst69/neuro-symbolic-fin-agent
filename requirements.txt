@@ -1,0 +1,21 @@
+# Data & Validation
+pydantic>=2.5.0
+pydantic-settings
+
+# API & Orchestration
+fastapi
+uvicorn
+
+# State & Idempotency (Mocked for dev, but establishes types)
+redis
+
+# Event Sourcing (Mocked for dev)
+kafka-python
+
+# Math & Logic
+numpy
+scipy
+
+# Testing
+pytest
+pytest-asyncio

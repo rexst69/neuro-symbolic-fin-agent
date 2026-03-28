@@ -1,0 +1,15 @@
+{
+  "id": "evt_3M12345",
+  "type": "charge.succeeded",
+  "created": 1677628800,
+  "data": {
+    "object": {
+      "id": "ch_3M12345",
+      "amount": 9971,
+      "currency": "usd",
+      "description": "Payment for INV-500",
+      "receipt_email": "billing@acmecorp.com",
+      "balance_transaction": "txn_12345"
+    }
+  }
+}
