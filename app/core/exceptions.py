@@ -2,7 +2,7 @@ from typing import Any, Dict, Optional
 
 
 class FinanceAgentError(Exception):
-    """Base exception for all Fin-Agent v3 errors."""
+    """Base exception for all errors."""
     def __init__(self, message: str, details: Optional[Dict[str, Any]] = None):
         super().__init__(message)
         self.message = message
