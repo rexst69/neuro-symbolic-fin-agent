@@ -71,10 +71,14 @@ class FinancePipeline:
         # Step 5: Probabilistic and temporal reasoning.
         if context.matched_invoices:
             target_invoice = context.matched_invoices[0]
-            context.belief_state["match_confidence"] = BayesianMatcher.calculate_confidence(
+            # Only update confidence if Bayesian score is higher than existing proposal
+            bayesian_confidence = BayesianMatcher.calculate_confidence(
                 transaction,
                 target_invoice,
             )
+            current_confidence = context.belief_state.get("match_confidence", 0.0)
+            if bayesian_confidence > current_confidence:
+                context.belief_state["match_confidence"] = bayesian_confidence
             context.belief_state["fx_drift"] = LiquidFXModel.predict_fx_drift(
                 transaction,
                 target_invoice,
@@ -89,14 +93,13 @@ class FinancePipeline:
         context.add_trace("FinancePipeline", "Policy decision computed.", {"decision": policy_decision})
 
         # Step 7: Compliance proofing.
-        if policy_decision != "ESCALATE_TO_HUMAN":
-            amount = transaction.amount
-            mock_gl_entries = [
-                _MockGLEntry(amount=amount, is_debit=True),
-                _MockGLEntry(amount=amount, is_debit=False),
-            ]
-            context.compliance_proof = LNN_GAAP_Validator.prove_double_entry(mock_gl_entries)
-            context.add_trace("FinancePipeline", "Compliance proof generated.")
+        amount = transaction.amount
+        mock_gl_entries = [
+            _MockGLEntry(amount=amount, is_debit=True),
+            _MockGLEntry(amount=amount, is_debit=False),
+        ]
+        context.compliance_proof = LNN_GAAP_Validator.prove_double_entry(mock_gl_entries)
+        context.add_trace("FinancePipeline", "Compliance proof generated.")
 
         # Step 8: Hard guardrails.
         context.workflow_state = "VALIDATING"
