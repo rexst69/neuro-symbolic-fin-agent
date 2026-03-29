@@ -1,8 +1,28 @@
 from datetime import datetime
-from typing import Any, Dict
 
 from app.core.context import AgentContext
-from app.schemas.finance_models import Currency, Transaction, TransactionType
+from app.core.exceptions import IdempotencyCollisionError
+from app.engine.bayesian_belief import BayesianMatcher
+from app.engine.liquid_nn_fx import LiquidFXModel
+from app.engine.lnn_accounting import LNN_GAAP_Validator
+from app.matching.engine import MatchingEngine
+from app.observability.audit_logger import AuditLogger
+from app.observability.sla_monitor import SLAMonitor
+from app.reconciliation.idempotency_manager import IdempotencyManager
+from app.reconciliation.state_verifier import StateVerifier
+from app.safety.edge_detectors.fees import FeeDetector
+from app.safety.guardrails import ActionValidator
+from app.safety.policy_matrix import PolicyMatrix
+from app.schemas.finance_models import Invoice, MatchStatus, Transaction
+from app.workflows.reconciliation_fsm import ReconciliationFSM
+
+
+class _MockGLEntry:
+    """Minimal ledger entry shape for deterministic compliance checks."""
+
+    def __init__(self, amount: float, is_debit: bool):
+        self.amount = amount
+        self.is_debit = is_debit
 
 
 class FinancePipeline:
@@ -12,97 +32,92 @@ class FinancePipeline:
     passes through all layers cleanly.
     """
 
-    def execute(self, raw_payload: Dict[str, Any]) -> AgentContext:
-        """
-        Executes the 12-step pipeline on a raw financial payload.
-        Returns the fully constructed AgentContext payload containing the execution traces.
-        """
-
-        # Step 1: Ingest & Normalize (Stub)
-        # Parse standard fields from raw payload to create our baseline Transaction schema
-        transaction = Transaction(
-            id=raw_payload.get("id", "txn_00000000"),
-            amount=raw_payload.get("amount", 0.0),
-            currency=Currency(raw_payload.get("currency", "USD")),
-            date=datetime.utcnow(),
-            reference=raw_payload.get("reference", "N/A"),
-            type=TransactionType(raw_payload.get("type", "PAYMENT")),
-            payer_name=raw_payload.get("payer_name"),
-            raw_source_id=raw_payload.get("raw_source_id")
-        )
-
-        # Step 2: Context Initialization
-        # Instantiate the AgentContext from the normalized transaction.
-        # This will securely carry the data entirely through the orchestrator.
+    def execute(self, transaction: Transaction, open_invoices: list[Invoice]) -> AgentContext:
+        """Execute the integrated 12-step reconciliation pipeline."""
+        # Step 1: Context initialization and timer start.
+        start_time = datetime.utcnow()
         context = AgentContext(transaction=transaction)
-        context.add_trace(
-            step_name="Context Initialization",
-            action_taken="Context instantiated from raw payload",
-            details={"transaction_id": transaction.id}
-        )
+        context.add_trace("FinancePipeline", "Pipeline started.", {"transaction_id": transaction.id})
 
-        # Step 3: Idempotency Check (Stub)
-        context.add_trace(
-            step_name="Idempotency Check",
-            action_taken="Idempotency lock acquired",
-            details={"status": "Lock Secured"}
-        )
+        # Step 2: Idempotency lock.
+        tx_hash = str(hash(transaction.id))
+        lock_acquired = IdempotencyManager().acquire_lock(tx_hash)
+        if not lock_acquired:
+            raise IdempotencyCollisionError("Transaction is already locked or processed.")
+        context.add_trace("FinancePipeline", "Idempotency lock acquired.", {"tx_hash": tx_hash})
 
-        # Step 4: Matching Layer (Stub)
-        context.add_trace(
-            step_name="Matching Layer",
-            action_taken="Matching engine executed",
-            details={"status": "Stubbed Match Execution"}
-        )
+        # Step 3: Matching cascade.
+        match_proposal = MatchingEngine.execute_cascade(transaction, open_invoices)
+        if match_proposal is not None:
+            invoice_lookup = {invoice.id: invoice for invoice in open_invoices}
+            context.matched_invoices = [
+                invoice_lookup[invoice_id]
+                for invoice_id in match_proposal.invoice_ids
+                if invoice_id in invoice_lookup
+            ]
+            context.match_status = MatchStatus.SUGGESTED
+            context.belief_state["match_confidence"] = match_proposal.match_confidence
+            context.belief_state["discrepancy_amount"] = match_proposal.discrepancy_amount
+            context.add_trace("FinancePipeline", "Matching completed with proposal.")
+        else:
+            context.match_status = MatchStatus.UNMATCHED
+            context.belief_state["match_confidence"] = 0.0
+            context.belief_state["discrepancy_amount"] = 0.0
+            context.add_trace("FinancePipeline", "No matching proposal found.")
 
-        # Step 5: Edge Detection (Stub)
-        context.add_trace(
-            step_name="Edge Detection",
-            action_taken="Edge cases evaluated",
-            details={"status": "No hard edges discovered"}
-        )
+        # Step 4: Edge detection.
+        FeeDetector.detect(context)
 
-        # Step 6: Reasoning (Bayes/Liquid NN) (Stub)
-        context.add_trace(
-            step_name="Reasoning Engine",
-            action_taken="Probabilistic and temporal reasoning applied",
-            details={"status": "Passed probabilistic thresholds"}
-        )
+        # Step 5: Probabilistic and temporal reasoning.
+        if context.matched_invoices:
+            target_invoice = context.matched_invoices[0]
+            context.belief_state["match_confidence"] = BayesianMatcher.calculate_confidence(
+                transaction,
+                target_invoice,
+            )
+            context.belief_state["fx_drift"] = LiquidFXModel.predict_fx_drift(
+                transaction,
+                target_invoice,
+            )
+        else:
+            context.belief_state["fx_drift"] = 0.0
+        context.add_trace("FinancePipeline", "Reasoning engines completed.")
 
-        # Step 7: Compliance (LNN) (Stub)
-        context.add_trace(
-            step_name="Compliance Engine",
-            action_taken="GAAP symbolic proof generated",
-            details={"status": "LNN Proof Simulated True"}
-        )
+        # Step 6: Policy evaluation.
+        policy_decision = PolicyMatrix.evaluate_action_risk(context)
+        context.belief_state["policy_decision"] = policy_decision
+        context.add_trace("FinancePipeline", "Policy decision computed.", {"decision": policy_decision})
 
-        # Step 8: Hybrid FSM Transition (Stub)
-        context.add_trace(
-            step_name="Hybrid FSM Transition",
-            action_taken="FSM determined next state",
-            details={"status": "FSM evaluated"}
-        )
+        # Step 7: Compliance proofing.
+        if policy_decision != "ESCALATE_TO_HUMAN":
+            amount = transaction.amount
+            mock_gl_entries = [
+                _MockGLEntry(amount=amount, is_debit=True),
+                _MockGLEntry(amount=amount, is_debit=False),
+            ]
+            context.compliance_proof = LNN_GAAP_Validator.prove_double_entry(mock_gl_entries)
+            context.add_trace("FinancePipeline", "Compliance proof generated.")
 
-        # Step 9: Action Validation (Stub)
-        context.add_trace(
-            step_name="Action Validation",
-            action_taken="Hard guardrails passed",
-            details={"status": "All safety checks passed"}
-        )
+        # Step 8: Hard guardrails.
+        context.workflow_state = "VALIDATING"
+        ActionValidator.hard_gate_check(context)
 
-        # Step 10: Execution (Stub)
-        context.add_trace(
-            step_name="Execution Layer",
-            action_taken="External API dispatch simulated",
-            details={"status": "ERP dispatched successfully"}
-        )
+        # Step 9: FSM execution.
+        context.workflow_state = "READY_TO_POST"
+        fsm = ReconciliationFSM(context)
+        fsm.process_posting()
+        context.workflow_state = fsm.state
 
-        # Step 11: Reconciliation (Stub)
-        context.add_trace(
-            step_name="Reconciliation Layer",
-            action_taken="ERP state verified",
-            details={"status": "ERP external state matched"}
-        )
+        # Step 10: State verification.
+        verified = StateVerifier.verify_erp_state(context)
+        if not verified:
+            raise ValueError("ERP state verification failed.")
+        context.workflow_state = "ERP_VERIFIED"
 
-        # Step 12: Return
+        # Step 11: SLA and audit commit.
+        end_time = datetime.utcnow()
+        SLAMonitor.record_execution_metrics(context, start_time, end_time)
+        AuditLogger.commit_trace(context)
+
+        # Step 12: Return context.
         return context

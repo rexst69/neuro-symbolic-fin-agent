@@ -1,8 +1,12 @@
 from typing import List, Optional
 
 from app.matching import composite_matcher, exact_matcher, probabilistic_matcher
-from app.schemas.audit_models import MatchProposal
 from app.schemas.finance_models import Invoice, Transaction
+
+try:
+    from app.schemas.audit_models import MatchProposal
+except ImportError:
+    from app.schemas.finance_models import MatchProposal
 
 
 class MatchingEngine:
