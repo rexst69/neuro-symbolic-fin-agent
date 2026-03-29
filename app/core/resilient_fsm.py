@@ -1,9 +1,16 @@
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Optional
 
 from pydantic import BaseModel, ConfigDict
 
 from app.core.context import AgentContext
-from app.core.exceptions import ExternalStateMismatchError, IdempotencyCollisionError
+from app.core.exceptions import (
+    IdempotencyCollisionError,
+    MissingRollbackActionError,
+    RecoveryHaltError,
+    RecoveryRollbackFailedError,
+    TransitionError,
+    TransitionExecutionError,
+)
 
 
 class Transition(BaseModel):
@@ -35,12 +42,17 @@ class ResilientFSM:
         Executes a transition with strict retry policies and idempotency checks.
         """
         if self.state != transition.from_state:
-            raise ValueError(
-                f"Invalid state transition. Current state '{self.state}' "
-                f"does not match expected starting state '{transition.from_state}'."
+            raise TransitionError(
+                "Invalid state transition.",
+                details={
+                    "current_state": self.state,
+                    "expected_from_state": transition.from_state,
+                    "to_state": transition.to_state,
+                },
             )
 
         attempts = 0
+        last_error: Optional[Exception] = None
         while attempts < transition.max_retries:
             attempts += 1
             try:
@@ -68,17 +80,28 @@ class ResilientFSM:
 
             except Exception as e:
                 # Log the temporary failure and allow loop to retry
+                last_error = e
                 self.context.add_trace(
                     step_name=f"FSM Transition: {transition.from_state} -> {transition.to_state}",
                     action_taken="FAILURE_ATTEMPT",
-                    details={"error": str(e), "attempt": attempts}
+                    details={
+                        "error": str(e),
+                        "error_type": type(e).__name__,
+                        "attempt": attempts,
+                    },
                 )
 
         # Loop exhausted max_retries
         self.state = "PARTIALLY_EXECUTED"
-        self._trigger_recovery(transition)
+        self._trigger_recovery(transition, last_error)
 
-    def _trigger_recovery(self, transition: Transition) -> None:
+        # This line is unreachable because recovery always raises a terminal exception.
+        raise TransitionExecutionError(
+            "Transition exhausted retries and failed recovery path unexpectedly.",
+            details={"from_state": transition.from_state, "to_state": transition.to_state},
+        )
+
+    def _trigger_recovery(self, transition: Transition, last_error: Optional[Exception]) -> None:
         """
         Attempts to execute the compensating action to rollback the state.
         Raises an exception upon completion to halt execution.
@@ -93,28 +116,52 @@ class ResilientFSM:
         if transition.rollback_action:
             try:
                 transition.rollback_action(self.context)
-                self.state = "FAILURE_RECONCILED"
-                self.context.add_trace(
-                    step_name=f"Recovery: {transition.from_state} -> {transition.to_state}",
-                    action_taken="ROLLBACK_SUCCESS",
-                    details={"info": "Rollback function securely reversed standard execution."}
-                )
-                raise Exception(
-                    "Pipeline halted gracefully. Execution failed but state was successfully rolled back."
-                )
             except Exception as e:
                 self.state = "AWAITING_RECOVERY"
                 self.context.add_trace(
                     step_name=f"Recovery: {transition.from_state} -> {transition.to_state}",
                     action_taken="ROLLBACK_FAILED",
-                    details={"error": str(e)}
+                    details={"error": str(e), "error_type": type(e).__name__},
                 )
-                raise Exception("Manual intervention required. Rollback action failed.") from e
+                raise RecoveryRollbackFailedError(
+                    "Manual intervention required. Rollback action failed.",
+                    details={
+                        "from_state": transition.from_state,
+                        "to_state": transition.to_state,
+                        "triggering_error": str(last_error) if last_error else None,
+                    },
+                ) from e
+
+            self.state = "FAILURE_RECONCILED"
+            self.context.add_trace(
+                step_name=f"Recovery: {transition.from_state} -> {transition.to_state}",
+                action_taken="ROLLBACK_SUCCESS",
+                details={
+                    "info": "Rollback function securely reversed standard execution.",
+                    "triggering_error": str(last_error) if last_error else None,
+                },
+            )
+            raise RecoveryHaltError(
+                "Pipeline halted gracefully. Execution failed but state was successfully rolled back.",
+                details={
+                    "from_state": transition.from_state,
+                    "to_state": transition.to_state,
+                    "attempts_exhausted": True,
+                },
+            )
         else:
             self.state = "AWAITING_RECOVERY"
             self.context.add_trace(
                 step_name=f"Recovery: {transition.from_state} -> {transition.to_state}",
                 action_taken="NO_ROLLBACK_ACTION_DEFINED",
-                details={}
+                details={
+                    "triggering_error": str(last_error) if last_error else None,
+                },
             )
-            raise Exception("Manual intervention required. No compensating rollback action was defined.")
+            raise MissingRollbackActionError(
+                "Manual intervention required. No compensating rollback action was defined.",
+                details={
+                    "from_state": transition.from_state,
+                    "to_state": transition.to_state,
+                },
+            )
