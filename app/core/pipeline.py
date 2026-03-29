@@ -1,4 +1,5 @@
-from datetime import datetime
+import logging
+from datetime import datetime, timezone
 
 from app.core.context import AgentContext
 from app.core.exceptions import IdempotencyCollisionError
@@ -15,6 +16,12 @@ from app.safety.guardrails import ActionValidator
 from app.safety.policy_matrix import PolicyMatrix
 from app.schemas.finance_models import Invoice, MatchStatus, Transaction
 from app.workflows.reconciliation_fsm import ReconciliationFSM
+
+
+logger = logging.getLogger(__name__)
+
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 
 class _MockGLEntry:
@@ -35,8 +42,11 @@ class FinancePipeline:
     def execute(self, transaction: Transaction, open_invoices: list[Invoice]) -> AgentContext:
         """Execute the integrated 12-step reconciliation pipeline."""
         # Step 1: Context initialization and timer start.
-        start_time = datetime.utcnow()
+        start_time = datetime.now(timezone.utc)
         context = AgentContext(transaction=transaction)
+        logger.info(
+            f"[INGEST] TransactionId={transaction.id} | Amount={transaction.amount:.2f} | Currency={transaction.currency}"
+        )
         context.add_trace("FinancePipeline", "Pipeline started.", {"transaction_id": transaction.id})
 
         # Step 2: Idempotency lock.
@@ -58,15 +68,22 @@ class FinancePipeline:
             context.match_status = MatchStatus.SUGGESTED
             context.belief_state["match_confidence"] = match_proposal.match_confidence
             context.belief_state["discrepancy_amount"] = match_proposal.discrepancy_amount
+            logger.info(
+                f"[MATCH] Status=SUGGESTED | Confidence={match_proposal.match_confidence:.4f} | "
+                f"Discrepancy={match_proposal.discrepancy_amount:.2f}"
+            )
             context.add_trace("FinancePipeline", "Matching completed with proposal.")
         else:
             context.match_status = MatchStatus.UNMATCHED
             context.belief_state["match_confidence"] = 0.0
             context.belief_state["discrepancy_amount"] = 0.0
+            logger.info("[MATCH] Status=UNMATCHED | Confidence=0.0000 | Discrepancy=0.00")
             context.add_trace("FinancePipeline", "No matching proposal found.")
 
         # Step 4: Edge detection.
+        logger.info("[EDGE] Running edge detectors.")
         FeeDetector.detect(context)
+        logger.info(f"[EDGE] Flags={context.edge_flags}")
 
         # Step 5: Probabilistic and temporal reasoning.
         if context.matched_invoices:
@@ -86,6 +103,7 @@ class FinancePipeline:
         else:
             context.belief_state["fx_drift"] = 0.0
         context.add_trace("FinancePipeline", "Reasoning engines completed.")
+        logger.info("[COMPLIANCE] Stage=Prepared")
 
         # Step 6: Policy evaluation.
         policy_decision = PolicyMatrix.evaluate_action_risk(context)
@@ -99,6 +117,9 @@ class FinancePipeline:
             _MockGLEntry(amount=amount, is_debit=False),
         ]
         context.compliance_proof = LNN_GAAP_Validator.prove_double_entry(mock_gl_entries)
+        logger.info(
+            f"[COMPLIANCE] Result={'PASS' if context.compliance_proof.result else 'FAIL'}"
+        )
         context.add_trace("FinancePipeline", "Compliance proof generated.")
 
         # Step 8: Hard guardrails.
@@ -107,6 +128,7 @@ class FinancePipeline:
 
         # Step 9: FSM execution.
         context.workflow_state = "READY_TO_POST"
+        logger.info("[EXECUTION] Starting workflow execution.")
         fsm = ReconciliationFSM(context)
         fsm.process_posting()
         context.workflow_state = fsm.state
@@ -116,10 +138,12 @@ class FinancePipeline:
         if not verified:
             raise ValueError("ERP state verification failed.")
         context.workflow_state = "ERP_VERIFIED"
+        logger.info("[VERIFY] ERP state verification passed.")
 
         # Step 11: SLA and audit commit.
-        end_time = datetime.utcnow()
+        end_time = datetime.now(timezone.utc)
         SLAMonitor.record_execution_metrics(context, start_time, end_time)
+        logger.info("[AUDIT] Committing decision trace.")
         AuditLogger.commit_trace(context)
 
         # Step 12: Return context.

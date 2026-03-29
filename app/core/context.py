@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, model_validator
@@ -44,7 +44,7 @@ class AgentContext(BaseModel):
         action = AuditAction(
             step_name=step_name,
             action_taken=action_taken,
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
             details=details
         )
         

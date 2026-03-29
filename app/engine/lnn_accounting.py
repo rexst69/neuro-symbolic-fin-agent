@@ -1,7 +1,11 @@
+import logging
 from typing import List
 
 from app.schemas.audit_models import LNNProof
 from app.schemas.finance_models import GL_Entry
+
+
+logger = logging.getLogger(__name__)
 
 
 class LNN_GAAP_Validator:
@@ -16,6 +20,22 @@ class LNN_GAAP_Validator:
         rounded_debits = round(total_debits, 2)
         rounded_credits = round(total_credits, 2)
         is_balanced = rounded_debits == rounded_credits
+        valid = is_balanced
+
+        logger.info(f"[COMPLIANCE] DoubleEntryCheck={'PASS' if valid else 'FAIL'}")
+
+        debit_entries = [round(entry.amount, 2) for entry in proposed_gl_entries if entry.is_debit]
+        credit_entries = [round(entry.amount, 2) for entry in proposed_gl_entries if not entry.is_debit]
+        if len(debit_entries) >= 2 and credit_entries:
+            logger.info(
+                f"[COMPLIANCE] Equation: Debit({debit_entries[0]:.2f}) + "
+                f"Debit({debit_entries[1]:.2f}) == Credit({credit_entries[0]:.2f})"
+            )
+        elif debit_entries and credit_entries:
+            logger.info(
+                f"[COMPLIANCE] Equation: Debit({debit_entries[0]:.2f}) "
+                f"== Credit({credit_entries[0]:.2f})"
+            )
 
         if is_balanced:
             logic_trace = (

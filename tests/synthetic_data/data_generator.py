@@ -1,6 +1,6 @@
 import json
 import random
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
 
 
@@ -9,7 +9,7 @@ def generate_mock_bank_feed() -> None:
     output_path = "tests/synthetic_data/mock_bank_feed.jsonl"
     lines = []
 
-    base_timestamp = int(datetime.utcnow().timestamp())
+    base_timestamp = int(datetime.now(timezone.utc).timestamp())
 
     for index in range(1, 11):
         invoice_ref = f"INV-{index:03d}"

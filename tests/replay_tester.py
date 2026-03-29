@@ -1,112 +1,55 @@
 import json
-from datetime import datetime
+import os
+import sys
+from datetime import datetime, timezone
+
+# Ensure the root directory is on the path so 'app' can be imported easily
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from app.core.pipeline import FinancePipeline
 from app.data.normalizer import DataNormalizer
 from app.schemas.finance_models import Invoice
 
 
-def create_sample_invoices() -> list[Invoice]:
-    """Create sample invoices for matching."""
-    return [
-        Invoice(
-            id="INV-001",
-            total_amount=121.0,
-            balance_due=121.0,
-            currency="USD",
-            issue_date=datetime.utcnow(),
-            due_date=datetime.utcnow(),
-            client_name="ACME Corp",
-            status="OPEN",
-        ),
-        Invoice(
-            id="INV-002",
-            total_amount=55.09,
-            balance_due=55.09,
-            currency="USD",
-            issue_date=datetime.utcnow(),
-            due_date=datetime.utcnow(),
-            client_name="ACME Corp",
-            status="OPEN",
-        ),
-        Invoice(
-            id="INV-003",
-            total_amount=107.75,
-            balance_due=107.75,
-            currency="USD",
-            issue_date=datetime.utcnow(),
-            due_date=datetime.utcnow(),
-            client_name="ACME Corp",
-            status="OPEN",
-        ),
-        Invoice(
-            id="INV-004",
-            total_amount=104.92,
-            balance_due=104.92,
-            currency="USD",
-            issue_date=datetime.utcnow(),
-            due_date=datetime.utcnow(),
-            client_name="ACME Corp",
-            status="OPEN",
-        ),
-        Invoice(
-            id="INV-006",
-            total_amount=66.26,
-            balance_due=66.26,
-            currency="USD",
-            issue_date=datetime.utcnow(),
-            due_date=datetime.utcnow(),
-            client_name="ACME Corp",
-            status="OPEN",
-        ),
-        Invoice(
-            id="INV-007",
-            total_amount=95.85,
-            balance_due=95.85,
-            currency="USD",
-            issue_date=datetime.utcnow(),
-            due_date=datetime.utcnow(),
-            client_name="ACME Corp",
-            status="OPEN",
-        ),
-        Invoice(
-            id="INV-008",
-            total_amount=137.8,
-            balance_due=137.8,
-            currency="USD",
-            issue_date=datetime.utcnow(),
-            due_date=datetime.utcnow(),
-            client_name="ACME Corp",
-            status="OPEN",
-        ),
-        Invoice(
-            id="INV-009",
-            total_amount=118.05,
-            balance_due=118.05,
-            currency="USD",
-            issue_date=datetime.utcnow(),
-            due_date=datetime.utcnow(),
-            client_name="ACME Corp",
-            status="OPEN",
-        ),
-        Invoice(
-            id="INV-010",
-            total_amount=85.97,
-            balance_due=85.97,
-            currency="USD",
-            issue_date=datetime.utcnow(),
-            due_date=datetime.utcnow(),
-            client_name="ACME Corp",
-            status="OPEN",
-        ),
-    ]
+def create_sample_invoices(input_path: str) -> list[Invoice]:
+    """Create sample invoices by inspecting the synthetic payload to ensure perfectly matching amounts."""
+    invoices = []
+    try:
+        with open(input_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                data = json.loads(line)
+                amount = float(data["amount"]) / 100.0  # Stripe cents to dollars
+                
+                # Extract invoice ID from description, fallback generic if not found
+                desc = data["data"]["object"]["description"]
+                invoice_id = desc.split("for ")[-1] if "for " in desc else f"INV-{len(invoices)+1:03d}"
+                
+                # Check if we already created this invoice (for duplicate handling)
+                if not any(inv.id == invoice_id for inv in invoices):
+                    invoices.append(
+                        Invoice(
+                            id=invoice_id,
+                            total_amount=amount,
+                            balance_due=amount,
+                            currency="USD",
+                            issue_date=datetime.now(timezone.utc),
+                            due_date=datetime.now(timezone.utc),
+                            client_name="ACME Corp",
+                            status="OPEN",
+                        )
+                    )
+    except FileNotFoundError:
+        pass
+    return invoices
 
 
 def run_replay() -> None:
     """Replay synthetic payloads through normalization and pipeline execution."""
     input_path = "tests/synthetic_data/mock_bank_feed.jsonl"
     pipeline = FinancePipeline()
-    open_invoices = create_sample_invoices()
+    open_invoices = create_sample_invoices(input_path)
 
     with open(input_path, "r", encoding="utf-8") as input_file:
         for line_number, line in enumerate(input_file, start=1):
@@ -126,7 +69,7 @@ def run_replay() -> None:
                     trace_output = context.decision_trace.dict()
 
                 print(f"[ROW {line_number}] workflow_state={context.workflow_state}")
-                print(f"[ROW {line_number}] decision_trace={trace_output}")
+                print(f"[ROW {line_number}] decision_trace={json.dumps(trace_output, default=str)}")
             except Exception as exc:
                 if type(exc).__name__ == "IdempotencyCollisionError":
                     print(

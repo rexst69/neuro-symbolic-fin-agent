@@ -1,5 +1,10 @@
+import logging
+
 from app.core.context import AgentContext
 from app.schemas.finance_models import MatchStatus
+
+
+logger = logging.getLogger(__name__)
 
 
 class PartialPayDetector:
@@ -21,4 +26,12 @@ class PartialPayDetector:
         if gap > (invoice.balance_due * 0.03):
             if "EDGE_PARTIAL_PAY" not in context.edge_flags:
                 context.edge_flags.append("EDGE_PARTIAL_PAY")
+            logger.info(
+                f"[EDGE] Type=EDGE_PARTIAL_PAY | Amount={gap:.2f} | "
+                f"Description=Partial payment detected for invoice {invoice.id}"
+            )
+            logger.info(
+                "[EDGE_RESOLUTION] Strategy=PARTIAL_PAYMENT_WORKFLOW | "
+                "Action=ESCALATE_OR_SPLIT_ALLOCATE"
+            )
             context.add_trace("PartialPayDetector", "Partial payment detected, flag added.")
